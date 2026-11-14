@@ -950,7 +950,14 @@ void FreeBlock(FontGraphicsBlock& block) {
     block.mutex = nullptr;
 }
 
+struct SlotRelease {
+    void** slot;
+    FontGraphicsInstance*& instance;
+    ~SlotRelease() { UnlockInstanceSlot(slot, instance); }
+};
+
 int CreateInstance(const FontGraphicsServiceParam* param, FontGraphicsInstance*& instance) {
+    if (param->enumerate == nullptr) NotImplemented_nid_no_patch(__func__);
     FontGraphicsBlock block{};
     if (const int error = AllocateBlock(block, param->instanceSize); error != SCE_FONT_OK) return error;
     auto* const created = static_cast<FontGraphicsInstance*>(block.address);
@@ -958,6 +965,10 @@ int CreateInstance(const FontGraphicsServiceParam* param, FontGraphicsInstance*&
     created->active = 1;
     created->block = block;
     param->enumerate(created->dispatch, FillBackendDispatch);
+    if (created->dispatch[0] == 0) {
+        FreeBlock(block);
+        NotImplemented_nid_no_patch(__func__);
+    }
     const auto init = reinterpret_cast<BackendInitFunction>(created->dispatch[0]);
     int initialized = 0;
     try {
@@ -979,11 +990,7 @@ int AttachInstance(const FontGraphicsServiceParam* param) {
     void** const slot = param->instanceSlot;
     if (slot == nullptr || param->instanceSize <= sizeof(FontGraphicsInstance)) return FONT_GRAPHICS_ERROR_INVALID_PARAMETER;
     FontGraphicsInstance* instance = LockInstanceSlot(slot);
-    struct SlotRelease {
-        void** slot;
-        FontGraphicsInstance*& instance;
-        ~SlotRelease() { UnlockInstanceSlot(slot, instance); }
-    } release{slot, instance};
+    const SlotRelease release{slot, instance};
     int error = SCE_FONT_OK;
     if (instance == nullptr) error = CreateInstance(param, instance);
     else if (instance->references == InstanceReferencesExhausted) error = FONT_GRAPHICS_ERROR_UNINITIALIZED;
@@ -993,15 +1000,20 @@ int AttachInstance(const FontGraphicsServiceParam* param) {
 
 void DetachInstance(void** slot) {
     FontGraphicsInstance* instance = LockInstanceSlot(slot);
+    const SlotRelease release{slot, instance};
     if (instance != nullptr && instance->references != 0) {
         if (--instance->references == 0) {
             FontGraphicsBlock block = instance->block;
-            reinterpret_cast<BackendTerminateFunction>(instance->dispatch[1])(instance);
+            try {
+                reinterpret_cast<BackendTerminateFunction>(instance->dispatch[1])(instance);
+            } catch (...) {
+                ++instance->references;
+                throw;
+            }
             FreeBlock(block);
         }
         instance = nullptr;
     }
-    UnlockInstanceSlot(slot, instance);
 }
 
 constexpr int FONT_GRAPHICS_ERROR_INVALID_DEVICE = static_cast<int>(0x80460081);
@@ -1049,8 +1061,11 @@ std::uint32_t BackendTextureSize(const FontGraphicsInstance* instance) {
 }
 
 int DeviceInstance(const FontGraphicsDeviceData* device, int invalid, FontGraphicsInstance*& instance) {
-    if (!IsObject(device) || device->tag != DeviceTag || device->service->tag != ServiceTag) return invalid;
-    instance = static_cast<FontGraphicsInstance*>(*device->service->instanceSlot);
+    if (!IsObject(device) || device->tag != DeviceTag || device->service == nullptr || device->service->tag != ServiceTag) return invalid;
+    void** const slot = device->service->instanceSlot;
+    if (slot == nullptr) return invalid;
+    instance = LockInstanceSlot(slot);
+    UnlockInstanceSlot(slot, instance);
     return instance == nullptr ? FONT_GRAPHICS_ERROR_UNINITIALIZED : SCE_FONT_OK;
 }
 
@@ -1248,6 +1263,7 @@ int GraphicsStructureSurfaceTexture(FontGraphicsDevice* device, const FontGraphi
     std::uint64_t base;
     std::memcpy(&base, source, sizeof(base));
     const std::uint32_t size = BackendTextureSize(instance);
+    if (base == 0) NotImplemented_nid_no_patch("sceFontGraphicsStructureSurfaceTexture");
     auto* const copy = static_cast<std::uint8_t*>(PoolAllocate(data->pool, SurfaceSize));
     if (copy == nullptr || data->pool == nullptr) return Fail(FONT_GRAPHICS_ERROR_NO_RECORD_SPACE);
     auto* const object = static_cast<FontSurfaceTexture*>(PoolAllocate(data->pool, size));
@@ -1255,7 +1271,6 @@ int GraphicsStructureSurfaceTexture(FontGraphicsDevice* device, const FontGraphi
         if (data->pool != nullptr) PoolFree(data->pool, copy, SurfaceSize);
         return Fail(FONT_GRAPHICS_ERROR_NO_RECORD_SPACE);
     }
-    if (base == 0) NotImplemented_nid_no_patch("sceFontGraphicsStructureSurfaceTexture");
     std::memcpy(copy, source, SurfaceSize);
     std::memset(object, 0, sizeof(*object));
     object->tag = SurfaceTextureTag;

@@ -209,6 +209,24 @@ enum GnmChannelTypeValue : std::uint32_t {
 
 constexpr std::uint32_t GnmRenderTargetTypeSrgb = 6;
 constexpr std::uint32_t GnmMicroTileTexels = 64;
+constexpr std::uint32_t GnmRowBits = 1024 * 8;
+constexpr std::uint32_t GnmColorInfoFormatShift = 2;
+constexpr std::uint32_t GnmColorInfoNumberTypeShift = 8;
+constexpr std::uint32_t GnmColorInfoCompSwapShift = 11;
+constexpr std::uint32_t GnmColorInfoBlendClamp = 1u << 15;
+constexpr std::uint32_t GnmColorInfoBlendBypass = 1u << 16;
+constexpr std::uint32_t GnmColorInfoRoundMode = 1u << 18;
+constexpr std::uint32_t GnmSelectZero = 0;
+constexpr std::uint32_t GnmSelectOne = 1;
+constexpr std::uint32_t GnmSelectX = 4;
+
+enum GnmChannelIndex : std::uint8_t { GnmX = 0, GnmY = 1, GnmZ = 2, GnmW = 3 };
+
+constexpr std::uint8_t GnmComponentSwapChannel[4][4][4] = {
+    {{GnmX}, {GnmY}, {GnmZ}, {GnmW}},
+    {{GnmX, GnmY}, {GnmX, GnmW}, {GnmY, GnmX}, {GnmW, GnmX}},
+    {{GnmX, GnmY, GnmZ}, {GnmX, GnmY, GnmW}, {GnmZ, GnmY, GnmX}, {GnmW, GnmY, GnmX}},
+    {{GnmX, GnmY, GnmZ, GnmW}, {GnmZ, GnmY, GnmX, GnmW}, {GnmW, GnmZ, GnmY, GnmX}, {GnmW, GnmX, GnmY, GnmZ}}};
 
 enum GnmSurfaceFormatValue : std::uint32_t {
     GnmFormatInvalid = 0x00,
@@ -397,6 +415,36 @@ constexpr std::uint32_t GnmThicknessOf(std::uint32_t arrayMode) {
     }
 }
 
+constexpr bool GnmIsMacroTiled(std::uint32_t arrayMode) { return arrayMode >= GnmArrayMode2dTiledThin1; }
+
+constexpr bool GnmIsPrt(std::uint32_t arrayMode) {
+    switch (arrayMode) {
+    case GnmArrayModePrtTiledThin1:
+    case GnmArrayModePrt2dTiledThin1:
+    case GnmArrayModePrtTiledThick:
+    case GnmArrayModePrt2dTiledThick:
+    case GnmArrayModePrt3dTiledThin1:
+    case GnmArrayModePrt3dTiledThick: return true;
+    default: return false;
+    }
+}
+
+constexpr bool GnmHasThinOrThickFallback(std::uint32_t arrayMode) {
+    if (arrayMode < GnmArrayMode1dTiledThin1 || arrayMode > GnmArrayMode3dTiledThick) return false;
+    switch (arrayMode) {
+    case GnmArrayMode2dTiledXThick:
+    case GnmArrayModePrtTiledThick:
+    case GnmArrayModePrt2dTiledThick: return false;
+    default: return true;
+    }
+}
+
+constexpr bool GnmTileModeHasBanks(std::uint32_t tileMode) {
+    if (tileMode >= 32) return false;
+    const std::uint32_t entry = GnmTileModes[tileMode];
+    return GnmIsMacroTiled((entry >> 2) & 0xf) && ((entry >> 22) & 7) != GnmMicroTileModeRotated;
+}
+
 constexpr std::uint32_t GnmThinOrThickTileMode(std::uint32_t arrayMode) {
     std::uint32_t tileMode = 0;
     while (tileMode < 0x1f) {
@@ -408,8 +456,8 @@ constexpr std::uint32_t GnmThinOrThickTileMode(std::uint32_t arrayMode) {
 }
 
 static_assert([] {
-    for (std::uint32_t arrayMode = 2; arrayMode < 0xe; ++arrayMode) {
-        if (((0xe3fu >> (arrayMode - 2)) & 1) != 0 && GnmThinOrThickTileMode(arrayMode) == 0x1f) return false;
+    for (std::uint32_t arrayMode = GnmArrayModeLinearGeneral; arrayMode <= GnmArrayModePrt3dTiledThick; ++arrayMode) {
+        if (GnmHasThinOrThickFallback(arrayMode) && GnmThinOrThickTileMode(arrayMode) == 0x1f) return false;
     }
     return true;
 }());
@@ -476,25 +524,29 @@ bool GnmTextureFormatSupported(std::uint32_t format) {
     } else if (surface == 0xd || surface == 0xf) {
         return false;
     }
-    const std::uint32_t type = (format >> 8) & 0xf;
-    if (type > 9 || ((0x2b3u >> type) & 1) == 0) return false;
+    switch ((format >> 8) & 0xf) {
+    case GnmChannelTypeUNorm:
+    case GnmChannelTypeSNorm:
+    case GnmChannelTypeUInt:
+    case GnmChannelTypeSInt:
+    case GnmChannelTypeFloat:
+    case GnmChannelTypeSrgb: break;
+    default: return false;
+    }
     return GnmSwizzle(format, nullptr);
 }
 
 std::uint32_t GnmDegradeArrayMode(std::uint32_t arrayMode, std::uint32_t bits) {
-    const std::uint32_t index = arrayMode - 3;
-    if (GnmThicknessOf(arrayMode) == 1) return arrayMode;
-    const std::uint32_t size = bits * GnmMicroTileTexels * GnmThicknessOf(arrayMode);
-    if (size < 0x2001) return arrayMode;
-    switch (index) {
-    case 0: return 3;
-    case 4: return 4;
-    case 5: return size < 0x4010 ? 7 : 4;
-    case 6: return 5;
-    case 7: return 6;
-    case 10: return 0xc;
-    case 11: return size < 0x4010 ? 0xd : 0xc;
-    case 12: return 0xb;
+    const std::uint32_t tileBits = bits * GnmMicroTileTexels * GnmThicknessOf(arrayMode);
+    if (GnmThicknessOf(arrayMode) == 1 || tileBits <= GnmRowBits) return arrayMode;
+    switch (arrayMode) {
+    case GnmArrayMode2dTiledThick: return GnmArrayMode2dTiledThin1;
+    case GnmArrayMode2dTiledXThick: return tileBits <= 2 * GnmRowBits ? GnmArrayMode2dTiledThick : GnmArrayMode2dTiledThin1;
+    case GnmArrayModePrtTiledThick: return GnmArrayModePrtTiledThin1;
+    case GnmArrayModePrt2dTiledThick: return GnmArrayModePrt2dTiledThin1;
+    case GnmArrayMode3dTiledThick: return GnmArrayMode3dTiledThin1;
+    case GnmArrayMode3dTiledXThick: return tileBits <= 2 * GnmRowBits ? GnmArrayMode3dTiledThick : GnmArrayMode3dTiledThin1;
+    case GnmArrayModePrt3dTiledThick: return GnmArrayModePrt3dTiledThin1;
     default: return arrayMode;
     }
 }
@@ -513,7 +565,7 @@ bool GnmTileModeForArrayMode(std::uint32_t tileMode, std::uint32_t arrayMode, st
         return true;
     case 1:
     case 4:
-        if (arrayMode - 2 >= 0xc || ((0xe3fu >> (arrayMode - 2)) & 1) == 0) return false;
+        if (!GnmHasThinOrThickFallback(arrayMode)) return false;
         result = GnmThinOrThickTileMode(arrayMode);
         return true;
     case 2:
@@ -536,7 +588,7 @@ GnmMacroTile GnmFindMacroTile(std::uint32_t tileMode, std::uint32_t bits, std::u
     if (fragments > 8 || tileMode > 0x1f) return {false, 0, 1};
     const std::uint32_t entry = GnmTileModes[tileMode];
     const std::uint32_t arrayMode = GnmArrayMode(entry);
-    if (((0xfff0u >> arrayMode) & 1) == 0 || bits - 1 > 0x7f) return {false, 0, arrayMode};
+    if (!GnmIsMacroTiled(arrayMode) || bits - 1 > 0x7f) return {false, 0, arrayMode};
     const std::uint32_t tileBytes = ((bits * GnmThicknessOf(arrayMode)) << 6) >> 3;
     const std::uint32_t scaled = tileBytes << ((entry >> 25) & 3);
     const std::uint32_t split = tileMode >= 8 ? (scaled >= 0x101 ? scaled : 0x100) : 0x40u << ((entry >> 11) & 7);
@@ -546,7 +598,7 @@ GnmMacroTile GnmFindMacroTile(std::uint32_t tileMode, std::uint32_t bits, std::u
     const auto byteBits = static_cast<std::uint32_t>(std::popcount(bytes));
     if (byteBits != 1) return {false, 0, byteBits};
     if (bytes < 0x40) return {false, 0, 1};
-    const std::uint32_t index = static_cast<std::uint32_t>(std::bit_width((bytes >> 6) | 1)) - 1 + (((0x8e60u >> arrayMode) & 1) != 0 ? 8 : 0);
+    const std::uint32_t index = static_cast<std::uint32_t>(std::bit_width((bytes >> 6) | 1)) - 1 + (GnmIsPrt(arrayMode) ? 8 : 0);
     return {true, index, 0};
 }
 
@@ -588,7 +640,7 @@ bool GnmComputeMacroLayout(std::uint32_t tileMode, std::uint32_t arrayMode, std:
     if (splitBytes * bankWidth * macroBankHeight >= 0x401) NotImplemented_nid_no_patch("sceFontGraphicsGnmSurfaceInit");
     std::uint32_t pitchAlign = macroAspect * pipes * bankWidth * 8;
     const std::uint32_t heightAlign = banks * macroBankHeight * 8 / macroAspect;
-    if (((0x8e60u >> arrayMode) & 1) != 0) {
+    if (GnmIsPrt(arrayMode)) {
         const std::uint32_t sliceBits = heightAlign * bits * pitchAlign;
         if (sliceBits <= 0x7ffff) {
             if (0x10000 % (sliceBits >> 3) != 0) return false;
@@ -636,13 +688,14 @@ bool GnmComputeSurface(std::uint32_t tileMode, bool neo, std::uint32_t width, st
 
 std::uint32_t GnmTextureFormatWord(std::uint32_t format) {
     const std::uint32_t numeric = GnmRenderTargetType((format >> 8) & 0xf);
-    const std::uint32_t paired = numeric & ~1u;
+    const bool normalized = numeric == GnmChannelTypeUNorm || numeric == GnmChannelTypeSNorm || numeric == GnmRenderTargetTypeSrgb;
+    const bool integer = numeric == GnmChannelTypeUInt || numeric == GnmChannelTypeSInt;
     std::uint32_t swizzle = 0;
     GnmSwizzle(format, &swizzle);
-    std::uint32_t word = numeric == 0 || numeric == 6 ? 0 : static_cast<std::uint32_t>(numeric != 1) << 18;
-    word |= static_cast<std::uint32_t>(paired == 4) << 16;
-    word |= static_cast<std::uint32_t>(numeric < 7 && ((0x43u >> numeric) & 1) != 0 && paired != 4) << 15;
-    return word | (swizzle & 3) << 11 | (numeric & 7) << 8 | (format << 2 & 0x7c);
+    std::uint32_t word = normalized ? GnmColorInfoBlendClamp : GnmColorInfoRoundMode;
+    if (integer) word |= GnmColorInfoBlendBypass;
+    return word | (swizzle & 3) << GnmColorInfoCompSwapShift | (numeric & 7) << GnmColorInfoNumberTypeShift |
+           (format & 0x1f) << GnmColorInfoFormatShift;
 }
 
 bool GnmInitTexture(std::uint8_t* output, std::uint32_t width, std::uint32_t height, std::uint32_t format, std::uint32_t tileMode,
@@ -671,19 +724,18 @@ std::uint32_t GnmFormatBits(std::uint32_t surface) {
     return GnmElementBits[surface] * scale;
 }
 
-constexpr std::uint32_t GnmChannelSelects[4][4][4] = {
-    {{4, 0, 0, 1}, {0, 4, 0, 1}, {0, 0, 4, 1}, {0, 0, 0, 4}},
-    {{4, 5, 0, 1}, {4, 0, 0, 5}, {5, 4, 0, 1}, {5, 0, 0, 4}},
-    {{4, 5, 6, 1}, {4, 5, 0, 6}, {6, 5, 4, 1}, {6, 5, 0, 4}},
-    {{4, 5, 6, 7}, {6, 5, 4, 7}, {7, 6, 5, 4}, {5, 6, 7, 4}}};
-
 std::uint32_t GnmTextureDataFormat(const std::uint8_t* texture) {
     const std::uint32_t word = Read32(texture, 0x10);
     const std::uint32_t surface = (word >> 2) & 0x1f;
     const std::uint32_t numeric = (word >> 8) & 7;
     const std::uint32_t count = GnmComponentCounts[surface];
-    const std::uint32_t* const selects = count - 1 < 4 ? GnmChannelSelects[count - 1][(word >> 11) & 3] : nullptr;
-    const std::uint32_t channels = selects != nullptr ? GnmDataFormat(0, 0, selects[0], selects[1], selects[2], selects[3]) : 1u << 21;
+    std::uint32_t channels = 1u << 21;
+    if (count - 1 < 4) {
+        std::uint32_t selects[4] = {GnmSelectZero, GnmSelectZero, GnmSelectZero, GnmSelectOne};
+        for (std::uint32_t component = 0; component < count; ++component)
+            selects[GnmComponentSwapChannel[count - 1][(word >> 11) & 3][component]] = GnmSelectX + component;
+        channels = GnmDataFormat(0, 0, selects[0], selects[1], selects[2], selects[3]);
+    }
     return surface | (numeric == 6 ? 0x900 : numeric << 8) | channels;
 }
 
@@ -701,7 +753,7 @@ std::uint32_t GnmTextureBankMask(const std::uint8_t* texture) {
 }
 
 bool GnmTextureHasBanks(const std::uint8_t* texture) {
-    return (GnmTextureDataFormat(texture) & 0xff) != 0 && ((0x7f7dcdfu >> (Read32(texture, 0x14) & 0x1f)) & 1) != 0;
+    return (GnmTextureDataFormat(texture) & 0xff) != 0 && GnmTileModeHasBanks(Read32(texture, 0x14) & 0x1f);
 }
 
 void GnmSetTextureBase(std::uint8_t* texture, std::uint32_t address) {
@@ -714,7 +766,7 @@ void GnmSetTextureBase(std::uint8_t* texture, std::uint32_t address) {
 
 void GnmSetTextureMetadata(std::uint8_t* texture, std::uint32_t address) {
     const std::uint32_t tiling = Read32(texture, 0x14);
-    if ((tiling & 0x7000) != 0 && ((0x7f7dcdfu >> ((tiling >> 5) & 0x1f)) & 1) != 0) {
+    if ((tiling & 0x7000) != 0 && GnmTileModeHasBanks((tiling >> 5) & 0x1f)) {
         const std::uint32_t mask = GnmTextureBankMask(texture);
         address = (address & ~mask) | (Read32(texture, 0x24) & mask);
     }
@@ -729,7 +781,7 @@ std::uint32_t GnmTextureBase(const std::uint8_t* texture) {
 std::uint32_t GnmResourceFragments(std::uint32_t word3) { return word3 >= 0xe0000000 ? 1u << ((word3 >> 16) & 0xf) : 1; }
 
 bool GnmResourceHasBanks(const std::uint32_t* resource) {
-    return (resource[1] & 0x3f00000) != 0 && ((0x7f7dcdfu >> ((resource[3] >> 20) & 0x1f)) & 1) != 0;
+    return (resource[1] & 0x3f00000) != 0 && GnmTileModeHasBanks((resource[3] >> 20) & 0x1f);
 }
 
 std::uint32_t GnmResourceBankMask(const std::uint32_t* resource, bool neo, bool incrementResidual) {
